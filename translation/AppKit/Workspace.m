@@ -25,9 +25,11 @@ static NSError *not_installed(NSURL *url) {
 }
 
 @interface NSRunningApplication : AKStubObject
++ (NSRunningApplication *)currentApplication;
+@property(readonly) NSString *bundleIdentifier;
 @end
 @implementation NSRunningApplication
-+ (instancetype)currentApplication { static NSRunningApplication *s; static dispatch_once_t once; dispatch_once(&once, ^{s=[self new];}); return s; }
++ (NSRunningApplication *)currentApplication { static NSRunningApplication *s; static dispatch_once_t once; dispatch_once(&once, ^{s=[self new];}); return s; }
 + (NSArray *)runningApplicationsWithBundleIdentifier:(NSString *)identifier {
     BOOL own=identifier && [identifier isEqual:self.currentApplication.bundleIdentifier];
     AKLog(@"running applications with bundle identifier %@: %@",identifier,own?@"this app":@"none");

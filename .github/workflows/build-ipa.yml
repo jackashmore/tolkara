@@ -1,0 +1,47 @@
+# An unsigned .ipa of Wolkara's runtime from this fork, for sideloading and
+# testing. Unlike release.yml it keeps the runner's public root certificates
+# (TOLKARA_SYSTEM_ROOTS=YES), which WoW needs to log in. The artifact is for
+# your own device, not for publishing.
+
+name: Build IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [wolkara-external-jit]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ipa:
+    name: Unsigned .ipa with root certificates
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build the unsigned .ipa
+        run: TOLKARA_SYSTEM_ROOTS=YES tools/package_ipa.sh Tolkara-unsigned.ipa
+
+      - name: Keep the build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: logs/
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Wolkara-unsigned-ipa
+          path: Tolkara-unsigned.ipa
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7

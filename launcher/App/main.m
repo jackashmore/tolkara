@@ -233,7 +233,10 @@ static BOOL PreparedFromOutside(void) { return hd_may_run_unsigned_code() || ng_
         name:@"AKTouchGameTextInputDidAppear" object:nil];
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(closeFromToolbar:)
         name:@"AKTouchCloseAppNotification" object:nil];
-    NSArray<NSString *> *arguments=NSProcessInfo.processInfo.arguments;
+    // The launch's own arguments: flags from Documents/tolkara-flags.txt turn on
+    // diagnostics but do not make a plain launch a development run.
+    NSMutableArray<NSString *> *arguments=[NSProcessInfo.processInfo.arguments mutableCopy];
+    [arguments removeObjectsInArray:documentFlags?:@[]];
     // Normal Wolkara launches use the route included in this build. Development
     // arguments retain the original explicit mode selection.
     NSString *source=nil;

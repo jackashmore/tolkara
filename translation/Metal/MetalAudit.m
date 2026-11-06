@@ -5,6 +5,7 @@
 // here alters what the guest gets. Installed after ManagedStorage.m's hooks so
 // it sees what the guest finally receives.
 #import <Metal/Metal.h>
+#import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <stdatomic.h>
 #import "AKSupport.h"
@@ -109,11 +110,56 @@ static id auditComputePipeline(id device, SEL selector, id<MTLFunction> function
     return result;
 }
 
-void AKInstallMetalAudit(Class device) {
+// The guest's drawables: how long each nextDrawable waits and what it returns,
+// with the layer's state when it returns nil (it times out after a second when
+// the layer cannot vend one).
+static id<CAMetalDrawable> (*nextDrawable)(id,SEL);
+static atomic_uint drawableCalls, drawableNils;
+static NSString *layerState(CAMetalLayer *layer) {
+    CALayer *top=layer; unsigned depth=0;
+    while (top.superlayer && depth<64) { top=top.superlayer; depth++; }
+    CGSize size=layer.drawableSize; CGRect bounds=layer.bounds;
+    return [NSString stringWithFormat:@"drawableSize=%gx%g bounds=%gx%g scale=%g format=%lu device=%@ hidden=%d opacity=%g depth=%u top=%@ topDelegate=%@ maxDrawables=%lu timeout=%d framebufferOnly=%d",
+        size.width,size.height,bounds.size.width,bounds.size.height,layer.contentsScale,(unsigned long)layer.pixelFormat,layer.device.name,
+        (int)layer.hidden,layer.opacity,depth,NSStringFromClass(top.class),NSStringFromClass([(id)top.delegate class]),
+        (unsigned long)layer.maximumDrawableCount,(int)layer.allowsNextDrawableTimeout,(int)layer.framebufferOnly];
+}
+static id<CAMetalDrawable> auditNextDrawable(id layer, SEL selector) {
+    unsigned call=atomic_fetch_add(&drawableCalls,1)+1;
+    double start=CACurrentMediaTime();
+    id<CAMetalDrawable> drawable=nextDrawable(layer,selector);
+    double waited=(CACurrentMediaTime()-start)*1000;
+    if (!drawable) {
+        unsigned count=atomic_fetch_add(&drawableNils,1)+1;
+        if (count<=12 || count%25==0) AKLog(@"Metal audit: nextDrawable %u returned nil after %.0f ms (nil %u) main=%d %@",call,waited,count,(int)NSThread.isMainThread,layerState(layer));
+    } else if (call<=3 || call==60 || waited>100) {
+        AKLog(@"Metal audit: nextDrawable %u -> %lux%lu after %.0f ms main=%d",call,(unsigned long)drawable.texture.width,(unsigned long)drawable.texture.height,waited,(int)NSThread.isMainThread);
+    }
+    return drawable;
+}
+// Command buffers that the GPU ends with an error, and the first commits.
+static void (*commit)(id,SEL);
+static atomic_uint commits, failures;
+static void auditCommit(id<MTLCommandBuffer> command, SEL selector) {
+    unsigned count=atomic_fetch_add(&commits,1)+1;
+    if (count<=3 || count==100 || count==1000) AKLog(@"Metal audit: command buffer %u committed",count);
+    [command addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        if (done.status!=MTLCommandBufferStatusError) return;
+        unsigned failed=atomic_fetch_add(&failures,1)+1;
+        if (failed<=16) AKLog(@"Metal audit: command buffer %u failed: %@",count,done.error);
+    }];
+    commit(command,selector);
+}
+
+void AKInstallMetalAudit(Class device, id<MTLDevice> instance) {
     static dispatch_once_t once;
     dispatch_once(&once,^{
         if (![NSProcessInfo.processInfo.arguments containsObject:@"--metal-audit"]) return;
-        AKLog(@"Metal audit: logging nil results and Managed storage requests (--metal-audit)");
+        AKLog(@"Metal audit: logging nil results, Managed storage requests, drawables and failed command buffers (--metal-audit)");
+        replace(CAMetalLayer.class,@selector(nextDrawable),(IMP)auditNextDrawable,(void **)&nextDrawable);
+        // A command buffer of this device gives the class the guest's commits use.
+        id<MTLCommandBuffer> sample=[[instance newCommandQueue] commandBuffer];
+        if (sample) replace(object_getClass(sample),@selector(commit),(IMP)auditCommit,(void **)&commit);
         replace(device,@selector(newBufferWithLength:options:),(IMP)auditBuffer,(void **)&buffer);
         replace(device,@selector(newBufferWithBytes:length:options:),(IMP)auditBytes,(void **)&bytesBuffer);
         replace(device,@selector(newBufferWithBytesNoCopy:length:options:deallocator:),(IMP)auditNoCopy,(void **)&noCopyBuffer);

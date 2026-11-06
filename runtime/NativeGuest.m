@@ -356,7 +356,9 @@ static void sample_all_threads(unsigned number) {
     if(threads) vm_deallocate(mach_task_self(),(vm_address_t)threads,count*sizeof(thread_act_t));
 }
 static void schedule_native_sample(thread_t thread, unsigned number) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,10*NSEC_PER_SEC),dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{
+    // User-interactive: a guest whose threads keep every core busy starved the
+    // utility queue, and no sample was taken before WoW Forever's crash.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,10*NSEC_PER_SEC),dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE,0),^{
         arm_thread_state64_t state={0}; mach_msg_type_number_t count=ARM_THREAD_STATE64_COUNT;
         kern_return_t kr=thread_get_state(thread,ARM_THREAD_STATE64,(thread_state_t)&state,&count);
         if(kr==KERN_SUCCESS) {

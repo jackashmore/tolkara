@@ -19,7 +19,10 @@
 #import "ExternalJITCoordinator.h"
 #endif
 #include "HostDiagnostics.h"
+#include <objc/runtime.h>
 #include <errno.h>
+// Flags read from Documents/tolkara-flags.txt; see loadDocumentFlags.
+static NSArray<NSString *> *documentFlags;
 #include <mach/mach_time.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -882,6 +885,7 @@ static BOOL PreparedFromOutside(void) { return hd_may_run_unsigned_code() || ng_
     setvbuf(stdout, NULL, _IOLBF, 0);
     for (NSString *argument in arguments) if ([argument hasPrefix:@"--probe-run-id="]) fprintf(log,"%s\n",argument.UTF8String);
     fprintf(log,"[host] execution mode=%s source=%s\n",ModeIdentifier(self.executionMode),self.executionModeSource.UTF8String);
+    if (documentFlags.count) fprintf(log,"[host] flags from Documents/tolkara-flags.txt: %s\n",[documentFlags componentsJoinedByString:@" "].UTF8String);
     NSString *map = [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"Guest/libraries.json"];
     NSError *error=nil;
     NSString *path=app ? [self.library executablePathForApp:app error:&error] : nil;
@@ -1252,6 +1256,33 @@ static BOOL PreparedFromOutside(void) { return hd_may_run_unsigned_code() || ng_
 }
 @end
 
+// Diagnostic flags for launches that cannot carry arguments: an External JIT
+// enabler starts the app with none. Each "--flag" line of
+// Documents/tolkara-flags.txt is appended to the process arguments, where the
+// runtime and adapters already look for them (--sample-native, ...).
+static IMP originalArguments;
+static NSArray<NSString *> *argumentsWithDocumentFlags(id self, SEL selector) {
+    NSArray<NSString *> *arguments=((NSArray<NSString *> *(*)(id,SEL))originalArguments)(self,selector);
+    return [arguments arrayByAddingObjectsFromArray:documentFlags];
+}
+static void loadDocumentFlags(void) {
+    NSString *path=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents/tolkara-flags.txt"];
+    NSString *text=[NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:NULL];
+    NSMutableArray<NSString *> *flags=[NSMutableArray new];
+    for (NSString *line in [text componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
+        NSString *flag=[line stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        if ([flag hasPrefix:@"--"] && ![NSProcessInfo.processInfo.arguments containsObject:flag]) [flags addObject:flag];
+    }
+    if (!flags.count) return;
+    documentFlags=flags.copy;
+    Method method=class_getInstanceMethod(object_getClass(NSProcessInfo.processInfo),@selector(arguments));
+    if (method) originalArguments=method_setImplementation(method,(IMP)argumentsWithDocumentFlags);
+    fprintf(stderr,"[host] flags from Documents/tolkara-flags.txt: %s\n",[documentFlags componentsJoinedByString:@" "].UTF8String);
+}
+
 int main(int argc, char *argv[]) {
-    @autoreleasepool { return UIApplicationMain(argc, argv, nil, NSStringFromClass(AKHostAppDelegate.class)); }
+    @autoreleasepool {
+        loadDocumentFlags();
+        return UIApplicationMain(argc, argv, nil, NSStringFromClass(AKHostAppDelegate.class));
+    }
 }

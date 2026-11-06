@@ -317,6 +317,10 @@ static void sample_all_threads(unsigned number) {
     if(task_threads(mach_task_self(),&threads,&count)!=KERN_SUCCESS) return;
     flockfile(guest.log);
     LOG("[native] threads sample %u count=%u\n",number,count);
+    task_vm_info_data_t vm={0}; mach_msg_type_number_t vm_count=TASK_VM_INFO_COUNT;
+    if(task_info(mach_task_self(),TASK_VM_INFO,(task_info_t)&vm,&vm_count)==KERN_SUCCESS && vm_count>=TASK_VM_INFO_REV1_COUNT)
+        LOG("[native] memory sample %u footprint=%llu resident=%llu available=%zu\n",number,
+            (unsigned long long)vm.phys_footprint,(unsigned long long)vm.resident_size,nc_available_memory());
     for(mach_msg_type_number_t i=0;i<count;i++) {
         arm_thread_state64_t state={0}; mach_msg_type_number_t stateCount=ARM_THREAD_STATE64_COUNT;
         kern_return_t kr=thread_get_state(threads[i],ARM_THREAD_STATE64,(thread_state_t)&state,&stateCount);

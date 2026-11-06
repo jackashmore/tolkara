@@ -402,8 +402,29 @@ static void *native_sampler(void *argument) {
         .constraint=(uint32_t)(10*millisecond),.preemptible=TRUE};
     kern_return_t kr=thread_policy_set(mach_thread_self(),THREAD_TIME_CONSTRAINT_POLICY,(thread_policy_t)&policy,THREAD_TIME_CONSTRAINT_POLICY_COUNT);
     LOG("[native] sampler thread running, real-time policy kr=%d\n",kr);
-    for(unsigned number=1;number<=360;number++) { sleep(10); take_native_sample(thread,number); }
+    // No timed wait: in WoW Forever this thread's sleep(10) had not returned a
+    // minute later, so the clock is polled, yielding in between.
+    uint64_t second=1000*millisecond, next=mach_absolute_time()+10*second;
+    for(unsigned number=1;number<=360;number++) {
+        while(mach_absolute_time()<next) sched_yield();
+        take_native_sample(thread,number);
+        next+=10*second;
+    }
     mach_port_deallocate(mach_task_self(),thread);
+    return NULL;
+}
+// Whether timed waits still end: a half-second usleep, timed by the clock.
+// The last line before a gap shows when they stopped.
+static void *timer_probe(void *argument) {
+    (void)argument;
+    pthread_setname_np("Tolkara timer probe");
+    mach_timebase_info_data_t timebase={0}; mach_timebase_info(&timebase);
+    for(unsigned i=1;i<=1200;i++) {
+        uint64_t before=mach_absolute_time();
+        usleep(500000);
+        double ms=(double)(mach_absolute_time()-before)*timebase.numer/timebase.denom/1e6;
+        if(i<=4 || i%20==0 || ms>1500) LOG("[native] timer probe %u: usleep(500 ms) took %.0f ms\n",i,ms);
+    }
     return NULL;
 }
 static void schedule_native_sample(thread_t thread, unsigned number) {
@@ -412,6 +433,8 @@ static void schedule_native_sample(thread_t thread, unsigned number) {
     int result=pthread_create(&sampler,NULL,native_sampler,(void *)(uintptr_t)thread);
     if(!result) pthread_detach(sampler);
     LOG("[native] sampling the main thread and all threads every 10 s: %s\n",result?strerror(result):"started");
+    pthread_t probe;
+    if(!pthread_create(&probe,NULL,timer_probe,NULL)) pthread_detach(probe);
 }
 static NSBundle *guest_bundle;
 static CFBundleRef guest_cf_bundle;

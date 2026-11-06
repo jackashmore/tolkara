@@ -34,6 +34,7 @@ static NativeCodeMemory local_quarantine;
 #include <mach/mach.h>
 #include <mach/arm/thread_status.h>
 #include <pthread.h>
+#include <string.h>
 #include <signal.h>
 #include <spawn.h>
 #include <arpa/inet.h>
@@ -355,10 +356,7 @@ static void sample_all_threads(unsigned number) {
     funlockfile(guest.log);
     if(threads) vm_deallocate(mach_task_self(),(vm_address_t)threads,count*sizeof(thread_act_t));
 }
-static void schedule_native_sample(thread_t thread, unsigned number) {
-    // User-interactive: a guest whose threads keep every core busy starved the
-    // utility queue, and no sample was taken before WoW Forever's crash.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,10*NSEC_PER_SEC),dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE,0),^{
+static void take_native_sample(thread_t thread, unsigned number) {
         arm_thread_state64_t state={0}; mach_msg_type_number_t count=ARM_THREAD_STATE64_COUNT;
         kern_return_t kr=thread_get_state(thread,ARM_THREAD_STATE64,(thread_state_t)&state,&count);
         if(kr==KERN_SUCCESS) {
@@ -377,9 +375,23 @@ static void schedule_native_sample(thread_t thread, unsigned number) {
             funlockfile(guest.log);
         } else LOG("[native] sample unavailable kr=%d\n",kr);
         sample_all_threads(number);
-        if(number<360) schedule_native_sample(thread,number+1);
-        else mach_port_deallocate(mach_task_self(),thread);
-    });
+}
+// A thread of its own: samples scheduled on dispatch's global queues never ran
+// while WoW Forever compiled its pipelines, on the utility or the
+// user-interactive queue.
+static void *native_sampler(void *argument) {
+    thread_t thread=(thread_t)(uintptr_t)argument;
+    pthread_setname_np("Tolkara native sampler");
+    for(unsigned number=1;number<=360;number++) { sleep(10); take_native_sample(thread,number); }
+    mach_port_deallocate(mach_task_self(),thread);
+    return NULL;
+}
+static void schedule_native_sample(thread_t thread, unsigned number) {
+    (void)number;
+    pthread_t sampler;
+    int result=pthread_create(&sampler,NULL,native_sampler,(void *)(uintptr_t)thread);
+    if(!result) pthread_detach(sampler);
+    LOG("[native] sampling the main thread and all threads every 10 s: %s\n",result?strerror(result):"started");
 }
 static NSBundle *guest_bundle;
 static CFBundleRef guest_cf_bundle;

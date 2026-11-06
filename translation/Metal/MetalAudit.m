@@ -151,6 +151,134 @@ static void auditCommit(id<MTLCommandBuffer> command, SEL selector) {
     commit(command,selector);
 }
 
+// Every other way to make a pipeline (options and reflection, or asynchronous
+// with a completion handler) and every way to take a function from a library:
+// the guest's worker threads compile pipelines while its first frame waits.
+static atomic_uint pipelines, pipelineNils;
+static _Atomic double slowest;
+static NSString *describe(id object) {
+    if (!object) return @"(nil)";
+    if ([object isKindOfClass:MTLRenderPipelineDescriptor.class]) {
+        MTLRenderPipelineDescriptor *d=object;
+        return [NSString stringWithFormat:@"render '%@' vertex=%@ fragment=%@ archives=%lu",d.label,d.vertexFunction.name,d.fragmentFunction.name,(unsigned long)d.binaryArchives.count];
+    }
+    if ([object isKindOfClass:MTLComputePipelineDescriptor.class]) {
+        MTLComputePipelineDescriptor *d=object;
+        return [NSString stringWithFormat:@"compute '%@' function=%@ archives=%lu",d.label,d.computeFunction.name,(unsigned long)d.binaryArchives.count];
+    }
+    if ([object conformsToProtocol:@protocol(MTLFunction)]) return [NSString stringWithFormat:@"function %@",((id<MTLFunction>)object).name];
+    if ([object respondsToSelector:@selector(label)]) return [NSString stringWithFormat:@"%@ '%@'",NSStringFromClass([object class]),[object label]];
+    return NSStringFromClass([object class]);
+}
+static void notePipeline(NSString *how, id request, id result, NSError *error, double start, unsigned long options) {
+    double elapsed=CACurrentMediaTime()-start;
+    unsigned count=atomic_fetch_add(&pipelines,1)+1;
+    double previous=atomic_load(&slowest);
+    while (elapsed>previous && !atomic_compare_exchange_weak(&slowest,&previous,elapsed)) {}
+    if (!result) {
+        unsigned failed=atomic_fetch_add(&pipelineNils,1)+1;
+        if (failed<=64) AKLog(@"Metal audit: nil pipeline from %@ after %.0f ms options=%#lx %@ error=%@ (pipeline %u, nil %u)",how,elapsed*1000,options,describe(request),error,count,failed);
+    } else if (elapsed>2) AKLog(@"Metal audit: pipeline %u took %.1f s (%@) %@",count,elapsed,how,describe(request));
+    if (count==1 || count%250==0) AKLog(@"Metal audit: %u pipelines so far, %u nil, slowest %.0f ms",count,atomic_load(&pipelineNils),atomic_load(&slowest)*1000);
+}
+typedef id (*OptionsCreator)(id,SEL,id,NSUInteger,void *,NSError *__autoreleasing *) RETAINED;
+typedef void (^Done2)(id,NSError *);
+typedef void (^Done3)(id,id,NSError *);
+typedef void (*Async2)(id,SEL,id,Done2);
+typedef void (*Async3)(id,SEL,id,NSUInteger,Done3);
+static IMP optionsOriginal[3], async2Original[2], async3Original[5];
+#define OPTIONS_HOOK(n) \
+static id optionsHook##n(id device, SEL selector, id request, NSUInteger options, void *reflection, NSError *__autoreleasing *error) RETAINED; \
+static id optionsHook##n(id device, SEL selector, id request, NSUInteger options, void *reflection, NSError *__autoreleasing *error) { \
+    NSError *local=nil; double start=CACurrentMediaTime(); \
+    id result=((OptionsCreator)optionsOriginal[n])(device,selector,request,options,reflection,&local); \
+    if (error) *error=local; \
+    notePipeline(NSStringFromSelector(selector),request,result,local,start,options); \
+    return result; \
+}
+OPTIONS_HOOK(0) OPTIONS_HOOK(1) OPTIONS_HOOK(2)
+#define ASYNC2_HOOK(n) \
+static void async2Hook##n(id device, SEL selector, id request, Done2 done) { \
+    double start=CACurrentMediaTime(); NSString *how=NSStringFromSelector(selector); \
+    ((Async2)async2Original[n])(device,selector,request,^(id result, NSError *error) { \
+        notePipeline(how,request,result,error,start,0); if (done) done(result,error); }); \
+}
+ASYNC2_HOOK(0) ASYNC2_HOOK(1)
+#define ASYNC3_HOOK(n) \
+static void async3Hook##n(id device, SEL selector, id request, NSUInteger options, Done3 done) { \
+    double start=CACurrentMediaTime(); NSString *how=NSStringFromSelector(selector); \
+    ((Async3)async3Original[n])(device,selector,request,options,^(id result, id reflection, NSError *error) { \
+        notePipeline(how,request,result,error,start,options); if (done) done(result,reflection,error); }); \
+}
+ASYNC3_HOOK(0) ASYNC3_HOOK(1) ASYNC3_HOOK(2) ASYNC3_HOOK(3) ASYNC3_HOOK(4)
+
+// Functions taken from the guest's libraries: a name a library does not carry
+// gives nil.
+typedef id (*NamedFunction)(id,SEL,NSString *) RETAINED;
+typedef id (*ConstantFunction)(id,SEL,NSString *,id,NSError *__autoreleasing *) RETAINED;
+typedef id (*DescriptorFunction)(id,SEL,id,NSError *__autoreleasing *) RETAINED;
+typedef void (*AsyncConstantFunction)(id,SEL,NSString *,id,Done2);
+typedef id (*LibraryLoader)(id,SEL,dispatch_data_t,NSError *__autoreleasing *) RETAINED;
+static NamedFunction namedFunction;
+static ConstantFunction constantFunction;
+static DescriptorFunction descriptorFunction;
+static AsyncConstantFunction asyncConstantFunction;
+static Async2 asyncDescriptorFunction;
+static LibraryLoader libraryLoader;
+static atomic_uint functionNils;
+static void noteFunction(NSString *how, NSString *name, id library, id result, NSError *error) {
+    if (result) return;
+    unsigned failed=atomic_fetch_add(&functionNils,1)+1;
+    if (failed<=64) AKLog(@"Metal audit: nil function %@ from %@ (%@ with %lu functions) error=%@ (nil %u)",name,how,
+        NSStringFromClass([library class]),(unsigned long)[[library functionNames] count],error,failed);
+}
+static id auditNamedFunction(id library, SEL selector, NSString *name) RETAINED;
+static id auditNamedFunction(id library, SEL selector, NSString *name) {
+    id result=namedFunction(library,selector,name); noteFunction(@"newFunctionWithName:",name,library,result,nil); return result;
+}
+static id auditConstantFunction(id library, SEL selector, NSString *name, id constants, NSError *__autoreleasing *error) RETAINED;
+static id auditConstantFunction(id library, SEL selector, NSString *name, id constants, NSError *__autoreleasing *error) {
+    NSError *local=nil; id result=constantFunction(library,selector,name,constants,&local); if (error) *error=local;
+    noteFunction(@"newFunctionWithName:constantValues:error:",name,library,result,local); return result;
+}
+static id auditDescriptorFunction(id library, SEL selector, MTLFunctionDescriptor *descriptor, NSError *__autoreleasing *error) RETAINED;
+static id auditDescriptorFunction(id library, SEL selector, MTLFunctionDescriptor *descriptor, NSError *__autoreleasing *error) {
+    NSError *local=nil; id result=descriptorFunction(library,selector,descriptor,&local); if (error) *error=local;
+    noteFunction(@"newFunctionWithDescriptor:error:",descriptor.name,library,result,local); return result;
+}
+static void auditAsyncConstantFunction(id library, SEL selector, NSString *name, id constants, Done2 done) {
+    asyncConstantFunction(library,selector,name,constants,^(id result, NSError *error) {
+        noteFunction(@"newFunctionWithName:constantValues:completionHandler:",name,library,result,error); if (done) done(result,error); });
+}
+static void auditAsyncDescriptorFunction(id library, SEL selector, MTLFunctionDescriptor *descriptor, Done2 done) {
+    NSString *name=descriptor.name;
+    asyncDescriptorFunction(library,selector,descriptor,^(id result, NSError *error) {
+        noteFunction(@"newFunctionWithDescriptor:completionHandler:",name,library,result,error); if (done) done(result,error); });
+}
+static void hookLibraryClass(Class cls) {
+    static Class hooked;
+    @synchronized(MTLRenderPipelineDescriptor.class) {
+        if (hooked==cls) return;
+        if (hooked) { AKLog(@"Metal audit: a second library class %@ is not audited (first %@)",NSStringFromClass(cls),NSStringFromClass(hooked)); return; }
+        hooked=cls;
+    }
+    AKLog(@"Metal audit: auditing functions of library class %@",NSStringFromClass(cls));
+    replace(cls,@selector(newFunctionWithName:),(IMP)auditNamedFunction,(void **)&namedFunction);
+    replace(cls,@selector(newFunctionWithName:constantValues:error:),(IMP)auditConstantFunction,(void **)&constantFunction);
+    replace(cls,@selector(newFunctionWithDescriptor:error:),(IMP)auditDescriptorFunction,(void **)&descriptorFunction);
+    replace(cls,@selector(newFunctionWithName:constantValues:completionHandler:),(IMP)auditAsyncConstantFunction,(void **)&asyncConstantFunction);
+    replace(cls,@selector(newFunctionWithDescriptor:completionHandler:),(IMP)auditAsyncDescriptorFunction,(void **)&asyncDescriptorFunction);
+}
+static id auditLibrary(id device, SEL selector, dispatch_data_t data, NSError *__autoreleasing *error) RETAINED;
+static id auditLibrary(id device, SEL selector, dispatch_data_t data, NSError *__autoreleasing *error) {
+    NSError *local=nil;
+    id library=libraryLoader(device,selector,data,&local);
+    if (error) *error=local;
+    if (library) hookLibraryClass(object_getClass(library));
+    else noteNil([NSString stringWithFormat:@"library from %zu bytes error=%@",dispatch_data_get_size(data),local]);
+    return library;
+}
+
 void AKInstallMetalAudit(Class device, id<MTLDevice> instance) {
     static dispatch_once_t once;
     dispatch_once(&once,^{
@@ -169,5 +297,17 @@ void AKInstallMetalAudit(Class device, id<MTLDevice> instance) {
         replace(device,@selector(newSamplerStateWithDescriptor:),(IMP)auditSampler,(void **)&sampler);
         replace(device,@selector(newRenderPipelineStateWithDescriptor:error:),(IMP)auditRenderPipeline,(void **)&renderPipeline);
         replace(device,@selector(newComputePipelineStateWithFunction:error:),(IMP)auditComputePipeline,(void **)&computePipeline);
+        replace(device,@selector(newRenderPipelineStateWithDescriptor:options:reflection:error:),(IMP)optionsHook0,(void **)&optionsOriginal[0]);
+        replace(device,@selector(newComputePipelineStateWithFunction:options:reflection:error:),(IMP)optionsHook1,(void **)&optionsOriginal[1]);
+        replace(device,@selector(newComputePipelineStateWithDescriptor:options:reflection:error:),(IMP)optionsHook2,(void **)&optionsOriginal[2]);
+        replace(device,@selector(newRenderPipelineStateWithDescriptor:completionHandler:),(IMP)async2Hook0,(void **)&async2Original[0]);
+        replace(device,@selector(newComputePipelineStateWithFunction:completionHandler:),(IMP)async2Hook1,(void **)&async2Original[1]);
+        replace(device,@selector(newRenderPipelineStateWithDescriptor:options:completionHandler:),(IMP)async3Hook0,(void **)&async3Original[0]);
+        replace(device,@selector(newComputePipelineStateWithFunction:options:completionHandler:),(IMP)async3Hook1,(void **)&async3Original[1]);
+        replace(device,@selector(newComputePipelineStateWithDescriptor:options:completionHandler:),(IMP)async3Hook2,(void **)&async3Original[2]);
+        replace(device,@selector(newRenderPipelineStateWithTileDescriptor:options:completionHandler:),(IMP)async3Hook3,(void **)&async3Original[3]);
+        replace(device,@selector(newRenderPipelineStateWithMeshDescriptor:options:completionHandler:),(IMP)async3Hook4,(void **)&async3Original[4]);
+        // After Devices.m's library loader, so the libraries seen are what the guest gets.
+        replace(device,@selector(newLibraryWithData:error:),(IMP)auditLibrary,(void **)&libraryLoader);
     });
 }

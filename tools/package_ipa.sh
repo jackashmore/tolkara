@@ -23,14 +23,16 @@ tools/generate.sh
 # the ZIPFoundation package's resource bundle that the app copies.
 xcodebuild -project Tolkara.xcodeproj -scheme TolkaraDiagnostics -configuration Release \
     -destination 'generic/platform=iOS' -derivedDataPath build/unsigned-derived \
-    ARCHS=arm64 SYMROOT=build/unsigned NATIVE_GUEST_SHIMS=GENERIC TOLKARA_MODE=external-jit \
+    ARCHS=arm64 NATIVE_GUEST_SHIMS=GENERIC TOLKARA_MODE=external-jit \
     TOLKARA_SYSTEM_ROOTS="${TOLKARA_SYSTEM_ROOTS:-YES}" \
     INFOPLIST_KEY_CFBundleDisplayName=Wolkara \
     CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
     build > "$LOG" 2>&1 \
     || { grep -E "error:" "$LOG" | head -20; echo "BUILD FAILED -> $LOG"; exit 1; }
 
-APP=build/unsigned/Release-iphoneos/TolkaraDiagnostics.app
+# No SYMROOT: a relative one is resolved per project, which put the package's
+# products inside its own checkout. Products stay in the derived data.
+APP=build/unsigned-derived/Build/Products/Release-iphoneos/TolkaraDiagnostics.app
 [ -d "$APP" ] || { echo "Build did not produce $APP -> $LOG"; exit 1; }
 # Asked to leave the root certificates out: make sure none were packaged.
 if [ "${TOLKARA_SYSTEM_ROOTS:-YES}" = NO ] && [ -n "$(find "$APP" -name CompatibilityRootCertificates.plist -print -quit)" ]; then

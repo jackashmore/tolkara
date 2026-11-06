@@ -19,8 +19,19 @@ concurrency:
 
 jobs:
   ipa:
-    name: Unsigned .ipa with root certificates
-    runs-on: macos-26
+    name: Unsigned .ipa with root certificates (${{ matrix.runner }})
+    # Hosted arm64 Macs are often short ("capacity constraints"); the Intel
+    # image carries the same Xcode and cross-builds the same arm64 app. Both
+    # run, and either artifact installs.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-26
+            suffix: ""
+          - runner: macos-26-intel
+            suffix: "-intel-runner"
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
 
@@ -34,13 +45,13 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs
+          name: build-logs${{ matrix.suffix }}
           path: logs/
           retention-days: 7
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Wolkara-unsigned-ipa
+          name: Wolkara-unsigned-ipa${{ matrix.suffix }}
           path: Tolkara-unsigned.ipa
           if-no-files-found: error
           compression-level: 0

@@ -467,43 +467,65 @@ static const char *census_image(uintptr_t pc) {
     for(unsigned i=0;i<census_image_count;i++) if(pc>=census_images[i].start && pc<census_images[i].end) return census_images[i].name;
     return "other";
 }
+// One census: every thread's kernel state and the image of its pc and lr.
+static thread_t census_main_thread;
+static uint64_t census_begin, census_second;
+static void census_snapshot(unsigned number, const char *why) {
+    thread_act_array_t threads=NULL; mach_msg_type_number_t count=0;
+    if(task_threads(mach_task_self(),&threads,&count)!=KERN_SUCCESS) return;
+    thread_t me=mach_thread_self();
+    census_write("census %u (%s) at %.1f s: %u threads
+",number,why,(double)(mach_absolute_time()-census_begin)/census_second,count);
+    for(mach_msg_type_number_t i=0;i<count;i++) {
+        thread_basic_info_data_t basic={0}; mach_msg_type_number_t basicCount=THREAD_BASIC_INFO_COUNT;
+        thread_extended_info_data_t extended={0}; mach_msg_type_number_t extendedCount=THREAD_EXTENDED_INFO_COUNT;
+        arm_thread_state64_t state={0}; mach_msg_type_number_t stateCount=ARM_THREAD_STATE64_COUNT;
+        bool b=thread_info(threads[i],THREAD_BASIC_INFO,(thread_info_t)&basic,&basicCount)==KERN_SUCCESS;
+        bool e=thread_info(threads[i],THREAD_EXTENDED_INFO,(thread_info_t)&extended,&extendedCount)==KERN_SUCCESS;
+        bool s=threads[i]!=me && thread_get_state(threads[i],ARM_THREAD_STATE64,(thread_state_t)&state,&stateCount)==KERN_SUCCESS;
+        uintptr_t pc=s?(uintptr_t)arm_thread_state64_get_pc(state):0, lr=s?(uintptr_t)arm_thread_state64_get_lr(state)&0x0000ffffffffffffULL:0;
+        census_write("  %u%s%s %-28s suspend=%d state=%d flags=%#x cpu=%d%% user=%d.%03d sys=%d.%03d pri=%d pc=%s lr=%s
+",i,
+            threads[i]==census_main_thread?"*":"",threads[i]==me?"<":"",
+            e?extended.pth_name:"",b?basic.suspend_count:-1,b?basic.run_state:-1,b?basic.flags:0,b?basic.cpu_usage*100/TH_USAGE_SCALE:-1,
+            b?basic.user_time.seconds:0,b?basic.user_time.microseconds/1000:0,b?basic.system_time.seconds:0,b?basic.system_time.microseconds/1000:0,
+            e?extended.pth_curpri:-1,census_image(pc),census_image(lr));
+        mach_port_deallocate(mach_task_self(),threads[i]);
+    }
+    mach_port_deallocate(mach_task_self(),me);
+    vm_deallocate(mach_task_self(),(vm_address_t)threads,count*sizeof(thread_act_t));
+}
+// From the guest's own threads, through memcpy and memset (which it calls all
+// the time): the census thread stopped being woken five seconds in, at real-time
+// priority, while the guest's threads went on. Every five seconds, 40 at most.
+static uint64_t census_due; static unsigned census_guest_count;
+static inline void census_from_guest(const char *why) {
+    if(census_fd<0 || !census_second) return;
+    uint64_t now=mach_absolute_time(), due=__atomic_load_n(&census_due,__ATOMIC_RELAXED);
+    if(now<due || !__atomic_compare_exchange_n(&census_due,&due,now+5*census_second,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)) return;
+    unsigned number=__atomic_add_fetch(&census_guest_count,1,__ATOMIC_RELAXED);
+    if(number>40) { __atomic_store_n(&census_due,UINT64_MAX,__ATOMIC_RELAXED); return; }
+    census_snapshot(number,why);
+}
 static void *thread_census(void *argument) {
-    thread_t main_thread=(thread_t)(uintptr_t)argument;
+    (void)argument;
     pthread_setname_np("Tolkara thread census");
-    mach_timebase_info_data_t timebase={0}; mach_timebase_info(&timebase);
-    uint64_t second=timebase.numer?1000000000ULL*timebase.denom/timebase.numer:24000000ULL;
-    uint64_t begin=mach_absolute_time(), next=begin;
-    // A periodic real-time thread woken by its deadline: polling at normal
-    // priority stopped after the second census, five seconds in, as every
-    // earlier sampler had: something keeps the cores from lower priorities.
+    uint64_t next=census_begin;
+    // A periodic real-time thread woken by its deadline. It and every earlier
+    // sampler stopped five to ten seconds into the guest's main.
+    uint64_t second=census_second;
     thread_time_constraint_policy_data_t policy={.period=(uint32_t)(5*second),.computation=(uint32_t)(second/200),
         .constraint=(uint32_t)(second/50),.preemptible=TRUE};
     kern_return_t kr=thread_policy_set(mach_thread_self(),THREAD_TIME_CONSTRAINT_POLICY,(thread_policy_t)&policy,THREAD_TIME_CONSTRAINT_POLICY_COUNT);
-    census_write("census start: %u images recorded, main thread port %u, real-time kr=%d\n",census_image_count,main_thread,kr);
+    census_write("census start: %u images recorded, main thread port %u, real-time kr=%d
+",census_image_count,census_main_thread,kr);
     for(unsigned number=1;number<=120;number++) {
         mach_wait_until(next);
         uint64_t late=mach_absolute_time()-next;
-        if(late>second/2) census_write("census %u woke %.1f s late\n",number,(double)late/second);
+        if(late>second/2) census_write("census thread %u woke %.1f s late
+",number,(double)late/second);
         next+=5*second;
-        thread_act_array_t threads=NULL; mach_msg_type_number_t count=0;
-        if(task_threads(mach_task_self(),&threads,&count)!=KERN_SUCCESS) continue;
-        thread_t me=mach_thread_self();
-        census_write("census %u at %.1f s: %u threads\n",number,(double)(mach_absolute_time()-begin)/second,count);
-        for(mach_msg_type_number_t i=0;i<count;i++) {
-            thread_basic_info_data_t basic={0}; mach_msg_type_number_t basicCount=THREAD_BASIC_INFO_COUNT;
-            thread_extended_info_data_t extended={0}; mach_msg_type_number_t extendedCount=THREAD_EXTENDED_INFO_COUNT;
-            arm_thread_state64_t state={0}; mach_msg_type_number_t stateCount=ARM_THREAD_STATE64_COUNT;
-            bool b=thread_info(threads[i],THREAD_BASIC_INFO,(thread_info_t)&basic,&basicCount)==KERN_SUCCESS;
-            bool e=thread_info(threads[i],THREAD_EXTENDED_INFO,(thread_info_t)&extended,&extendedCount)==KERN_SUCCESS;
-            bool s=threads[i]!=me && thread_get_state(threads[i],ARM_THREAD_STATE64,(thread_state_t)&state,&stateCount)==KERN_SUCCESS;
-            uintptr_t pc=s?(uintptr_t)arm_thread_state64_get_pc(state):0, lr=s?(uintptr_t)arm_thread_state64_get_lr(state)&0x0000ffffffffffffULL:0;
-            census_write("  %u%s %-28s suspend=%d state=%d cpu=%d%% user=%d.%03d pri=%d pc=%s lr=%s\n",i,threads[i]==main_thread?"*":"",
-                e?extended.pth_name:"",b?basic.suspend_count:-1,b?basic.run_state:-1,b?basic.cpu_usage*100/TH_USAGE_SCALE:-1,
-                b?basic.user_time.seconds:0,b?basic.user_time.microseconds/1000:0,e?extended.pth_curpri:-1,census_image(pc),census_image(lr));
-            mach_port_deallocate(mach_task_self(),threads[i]);
-        }
-        mach_port_deallocate(mach_task_self(),me);
-        vm_deallocate(mach_task_self(),(vm_address_t)threads,count*sizeof(thread_act_t));
+        census_snapshot(number,"census thread");
     }
     return NULL;
 }
@@ -511,8 +533,12 @@ static void schedule_native_sample(thread_t thread, unsigned number) {
     (void)number; (void)native_sampler; (void)timer_probe;
     census_fd=open([[NSHomeDirectory() stringByAppendingPathComponent:@"Documents/native-census.log"] fileSystemRepresentation],O_WRONLY|O_CREAT|O_TRUNC,0600);
     census_record_images();
+    mach_timebase_info_data_t timebase={0}; mach_timebase_info(&timebase);
+    census_main_thread=thread; census_begin=mach_absolute_time();
+    census_second=timebase.numer?1000000000ULL*timebase.denom/timebase.numer:24000000ULL;
+    census_due=census_begin+5*census_second;
     pthread_t census;
-    int result=pthread_create(&census,NULL,thread_census,(void *)(uintptr_t)thread);
+    int result=pthread_create(&census,NULL,thread_census,NULL);
     if(!result) pthread_detach(census);
     LOG("[native] thread census every 5 s into Documents/native-census.log: %s\n",result?strerror(result):"started");
 }
@@ -654,6 +680,7 @@ static void *write_view(void *destination, size_t size) {
     return destination;
 }
 static void *guest_memcpy(void *destination, const void *source, size_t size) {
+    census_from_guest("guest memcpy");
     if (inside_exec(destination,size)) {
         if (!final_image_write(destination,source,size)) abort();
         return destination;
@@ -682,6 +709,7 @@ static void *guest_memmove(void *destination, const void *source, size_t size) {
     return destination;
 }
 static void *guest_memset(void *destination, int value, size_t size) {
+    census_from_guest("guest memset");
     if (inside_exec(destination,size)) {
         if (!final_image_memset(destination,value,size)) abort();
         return destination;

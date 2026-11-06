@@ -24,6 +24,9 @@ static NativeCodeMemory local_quarantine;
 #include "SignedImage.h"
 #include <dlfcn.h>
 #include <mach-o/loader.h>
+#include <mach-o/dyld.h>
+#include <fcntl.h>
+#include <stdarg.h>
 #import <objc/objc-exception.h>
 #import <objc/runtime.h>
 #include <dirent.h>
@@ -427,14 +430,83 @@ static void *timer_probe(void *argument) {
     }
     return NULL;
 }
+// A census of every thread every five seconds into Documents/native-census.log,
+// written with write(2) and nothing else: no stdio lock, no dladdr, no dyld
+// lock, no timed wait. The sampler above took the log's lock around dladdr and
+// froze a WoW Forever run at its first sample. Program counters are placed in
+// an image by ranges recorded before the guest starts (or in the guest's
+// arena); only our own threads' kernel state is read.
+static int census_fd=-1;
+static void census_write(const char *format, ...) __attribute__((format(printf,1,2)));
+static void census_write(const char *format, ...) {
+    char line[768]; va_list arguments; va_start(arguments,format);
+    int length=vsnprintf(line,sizeof line,format,arguments); va_end(arguments);
+    if(length>0 && census_fd>=0) (void)!write(census_fd,line,(size_t)(length<(int)sizeof line?length:(int)sizeof line-1));
+}
+typedef struct { uintptr_t start, end; const char *name; } CensusImage;
+static CensusImage census_images[1024]; static unsigned census_image_count;
+static void census_record_images(void) {
+    uint32_t count=_dyld_image_count();
+    for(uint32_t i=0;i<count && census_image_count<1024;i++) {
+        const struct mach_header_64 *header=(const struct mach_header_64 *)_dyld_get_image_header(i);
+        const char *name=_dyld_get_image_name(i);
+        if(!header || header->magic!=MH_MAGIC_64) continue;
+        intptr_t slide=_dyld_get_image_vmaddr_slide(i);
+        const struct load_command *command=(const struct load_command *)(header+1);
+        for(uint32_t c=0;c<header->ncmds;c++,command=(const struct load_command *)((const char *)command+command->cmdsize))
+            if(command->cmd==LC_SEGMENT_64 && !strcmp(((const struct segment_command_64 *)command)->segname,"__TEXT")) {
+                const struct segment_command_64 *text=(const struct segment_command_64 *)command;
+                const char *leaf=name?strrchr(name,'/'):NULL;
+                census_images[census_image_count++]=(CensusImage){(uintptr_t)(text->vmaddr+slide),(uintptr_t)(text->vmaddr+slide+text->vmsize),leaf?leaf+1:(name?name:"?")};
+            }
+    }
+}
+static const char *census_image(uintptr_t pc) {
+    if(!pc) return "-";
+    if(inside((const void *)pc,1)) return "guest";
+    for(unsigned i=0;i<census_image_count;i++) if(pc>=census_images[i].start && pc<census_images[i].end) return census_images[i].name;
+    return "other";
+}
+static void *thread_census(void *argument) {
+    thread_t main_thread=(thread_t)(uintptr_t)argument;
+    pthread_setname_np("Tolkara thread census");
+    mach_timebase_info_data_t timebase={0}; mach_timebase_info(&timebase);
+    uint64_t second=timebase.numer?1000000000ULL*timebase.denom/timebase.numer:24000000ULL;
+    uint64_t begin=mach_absolute_time(), next=begin;
+    census_write("census start: %u images recorded, main thread port %u\n",census_image_count,main_thread);
+    for(unsigned number=1;number<=120;number++) {
+        while(mach_absolute_time()<next) sched_yield();
+        next+=5*second;
+        thread_act_array_t threads=NULL; mach_msg_type_number_t count=0;
+        if(task_threads(mach_task_self(),&threads,&count)!=KERN_SUCCESS) continue;
+        thread_t me=mach_thread_self();
+        census_write("census %u at %.1f s: %u threads\n",number,(double)(mach_absolute_time()-begin)/second,count);
+        for(mach_msg_type_number_t i=0;i<count;i++) {
+            thread_basic_info_data_t basic={0}; mach_msg_type_number_t basicCount=THREAD_BASIC_INFO_COUNT;
+            thread_extended_info_data_t extended={0}; mach_msg_type_number_t extendedCount=THREAD_EXTENDED_INFO_COUNT;
+            arm_thread_state64_t state={0}; mach_msg_type_number_t stateCount=ARM_THREAD_STATE64_COUNT;
+            bool b=thread_info(threads[i],THREAD_BASIC_INFO,(thread_info_t)&basic,&basicCount)==KERN_SUCCESS;
+            bool e=thread_info(threads[i],THREAD_EXTENDED_INFO,(thread_info_t)&extended,&extendedCount)==KERN_SUCCESS;
+            bool s=threads[i]!=me && thread_get_state(threads[i],ARM_THREAD_STATE64,(thread_state_t)&state,&stateCount)==KERN_SUCCESS;
+            uintptr_t pc=s?(uintptr_t)arm_thread_state64_get_pc(state):0, lr=s?(uintptr_t)arm_thread_state64_get_lr(state)&0x0000ffffffffffffULL:0;
+            census_write("  %u%s %-28s suspend=%d state=%d cpu=%d%% user=%d.%03d pri=%d pc=%s lr=%s\n",i,threads[i]==main_thread?"*":"",
+                e?extended.pth_name:"",b?basic.suspend_count:-1,b?basic.run_state:-1,b?basic.cpu_usage*100/TH_USAGE_SCALE:-1,
+                b?basic.user_time.seconds:0,b?basic.user_time.microseconds/1000:0,e?extended.pth_curpri:-1,census_image(pc),census_image(lr));
+            mach_port_deallocate(mach_task_self(),threads[i]);
+        }
+        mach_port_deallocate(mach_task_self(),me);
+        vm_deallocate(mach_task_self(),(vm_address_t)threads,count*sizeof(thread_act_t));
+    }
+    return NULL;
+}
 static void schedule_native_sample(thread_t thread, unsigned number) {
-    (void)number;
-    pthread_t sampler;
-    int result=pthread_create(&sampler,NULL,native_sampler,(void *)(uintptr_t)thread);
-    if(!result) pthread_detach(sampler);
-    LOG("[native] sampling the main thread and all threads every 10 s: %s\n",result?strerror(result):"started");
-    pthread_t probe;
-    if(!pthread_create(&probe,NULL,timer_probe,NULL)) pthread_detach(probe);
+    (void)number; (void)native_sampler; (void)timer_probe;
+    census_fd=open([[NSHomeDirectory() stringByAppendingPathComponent:@"Documents/native-census.log"] fileSystemRepresentation],O_WRONLY|O_CREAT|O_TRUNC,0600);
+    census_record_images();
+    pthread_t census;
+    int result=pthread_create(&census,NULL,thread_census,(void *)(uintptr_t)thread);
+    if(!result) pthread_detach(census);
+    LOG("[native] thread census every 5 s into Documents/native-census.log: %s\n",result?strerror(result):"started");
 }
 static NSBundle *guest_bundle;
 static CFBundleRef guest_cf_bundle;

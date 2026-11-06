@@ -32,7 +32,7 @@ static NSError *not_installed(NSURL *url) {
 + (NSRunningApplication *)currentApplication { static NSRunningApplication *s; static dispatch_once_t once; dispatch_once(&once, ^{s=[self new];}); return s; }
 + (NSArray *)runningApplicationsWithBundleIdentifier:(NSString *)identifier {
     BOOL own=identifier && [identifier isEqual:self.currentApplication.bundleIdentifier];
-    AKLog(@"running applications with bundle identifier %@: %@",identifier,own?@"this app":@"none");
+    AKLog(@"running applications with bundle identifier %@: %@ (asked from %p)",identifier,own?@"this app":@"none",__builtin_return_address(0));
     return own?@[self.currentApplication]:@[];
 }
 + (instancetype)runningApplicationWithProcessIdentifier:(pid_t)pid { return pid==getpid()?self.currentApplication:nil; }

@@ -945,6 +945,11 @@ static void logLayer(CALayer *layer,unsigned depth) {
     if(!NSThread.isMainThread) { dispatch_async(dispatch_get_main_queue(),^{[self terminate:nil];});return; }
     if(_terminating)return;
     _terminating=YES;
+    // Who asked: raw return addresses (subtract the logged slide for the guest's own).
+    NSArray<NSNumber *> *callers=NSThread.callStackReturnAddresses;
+    NSMutableArray<NSString *> *frames=[NSMutableArray array];
+    for(NSUInteger i=1;i<callers.count && i<16;i++)[frames addObject:[NSString stringWithFormat:@"%#llx",callers[i].unsignedLongLongValue]];
+    AKLog(@"terminate: requested from %@",[frames componentsJoinedByString:@" "]);
     NSUInteger reply=1;
     SEL selector=@selector(applicationShouldTerminate:);
     if([_delegate respondsToSelector:selector])reply=((NSUInteger (*)(id,SEL,id))[_delegate methodForSelector:selector])(_delegate,selector,self);

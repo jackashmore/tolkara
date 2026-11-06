@@ -473,9 +473,17 @@ static void *thread_census(void *argument) {
     mach_timebase_info_data_t timebase={0}; mach_timebase_info(&timebase);
     uint64_t second=timebase.numer?1000000000ULL*timebase.denom/timebase.numer:24000000ULL;
     uint64_t begin=mach_absolute_time(), next=begin;
-    census_write("census start: %u images recorded, main thread port %u\n",census_image_count,main_thread);
+    // A periodic real-time thread woken by its deadline: polling at normal
+    // priority stopped after the second census, five seconds in, as every
+    // earlier sampler had: something keeps the cores from lower priorities.
+    thread_time_constraint_policy_data_t policy={.period=(uint32_t)(5*second),.computation=(uint32_t)(second/200),
+        .constraint=(uint32_t)(second/50),.preemptible=TRUE};
+    kern_return_t kr=thread_policy_set(mach_thread_self(),THREAD_TIME_CONSTRAINT_POLICY,(thread_policy_t)&policy,THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+    census_write("census start: %u images recorded, main thread port %u, real-time kr=%d\n",census_image_count,main_thread,kr);
     for(unsigned number=1;number<=120;number++) {
-        while(mach_absolute_time()<next) sched_yield();
+        mach_wait_until(next);
+        uint64_t late=mach_absolute_time()-next;
+        if(late>second/2) census_write("census %u woke %.1f s late\n",number,(double)late/second);
         next+=5*second;
         thread_act_array_t threads=NULL; mach_msg_type_number_t count=0;
         if(task_threads(mach_task_self(),&threads,&count)!=KERN_SUCCESS) continue;

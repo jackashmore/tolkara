@@ -8,6 +8,9 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <stdatomic.h>
+#include <dlfcn.h>
+#include <mach/mach.h>
+#include <string.h>
 #import "AKSupport.h"
 
 #define RETAINED __attribute__((ns_returns_retained))
@@ -28,6 +31,39 @@ static void replace(Class cls, SEL selector, IMP replacement, void **original) {
     if (!method) { AKLog(@"Metal audit: the device has no %@",NSStringFromSelector(selector)); return; }
     *original=(void *)method_getImplementation(method);
     class_replaceMethod(cls,selector,replacement,method_getTypeEncoding(method));
+}
+// Every thread of the process, at most once per five seconds, from whichever
+// thread is calling Metal: in WoW Forever the runtime's own sampler and timer
+// threads stop running about two seconds into the guest's main while the
+// guest's threads go on, so this census runs on the guest's Metal calls.
+// Our own threads' state and the image their program counter is in; no guest
+// memory is read.
+static void threadCensus(NSString *why) {
+    static _Atomic double last; static atomic_uint taken;
+    double now=CACurrentMediaTime(), previous=atomic_load(&last);
+    if (now-previous<5 || !atomic_compare_exchange_strong(&last,&previous,now) || atomic_fetch_add(&taken,1)>=24) return;
+    thread_act_array_t threads=NULL; mach_msg_type_number_t count=0;
+    if (task_threads(mach_task_self(),&threads,&count)!=KERN_SUCCESS) return;
+    thread_t me=mach_thread_self();
+    NSMutableString *report=[NSMutableString stringWithFormat:@"Metal audit: thread census (%@) count=%u self=%@\n",why,count,NSThread.currentThread.name];
+    for (mach_msg_type_number_t i=0;i<count;i++) {
+        thread_basic_info_data_t basic={0}; mach_msg_type_number_t basicCount=THREAD_BASIC_INFO_COUNT;
+        thread_extended_info_data_t extended={0}; mach_msg_type_number_t extendedCount=THREAD_EXTENDED_INFO_COUNT;
+        arm_thread_state64_t state={0}; mach_msg_type_number_t stateCount=ARM_THREAD_STATE64_COUNT;
+        BOOL b=thread_info(threads[i],THREAD_BASIC_INFO,(thread_info_t)&basic,&basicCount)==KERN_SUCCESS;
+        BOOL e=thread_info(threads[i],THREAD_EXTENDED_INFO,(thread_info_t)&extended,&extendedCount)==KERN_SUCCESS;
+        BOOL s=threads[i]!=me && thread_get_state(threads[i],ARM_THREAD_STATE64,(thread_state_t)&state,&stateCount)==KERN_SUCCESS;
+        uintptr_t pc=s?(uintptr_t)arm_thread_state64_get_pc(state):0;
+        Dl_info info={0}; const char *image=pc && dladdr((void *)pc,&info) && info.dli_fname ? strrchr(info.dli_fname,'/') : NULL;
+        [report appendFormat:@"  %u name=%s suspend=%d state=%d cpu=%d%% user=%d.%03ds priority=%d pc-image=%s symbol=%s\n",i,
+            e?extended.pth_name:"",b?basic.suspend_count:-1,b?basic.run_state:-1,b?basic.cpu_usage*100/TH_USAGE_SCALE:-1,
+            b?basic.user_time.seconds:0,b?basic.user_time.microseconds/1000:0,e?extended.pth_curpri:-1,
+            image?image+1:(pc?"guest or anonymous":"self"),info.dli_sname?:""];
+        mach_port_deallocate(mach_task_self(),threads[i]);
+    }
+    mach_port_deallocate(mach_task_self(),me);
+    vm_deallocate(mach_task_self(),(vm_address_t)threads,count*sizeof(thread_act_t));
+    AKLog(@"%@",report);
 }
 static void noteManaged(unsigned long mode, NSString *what) {
     unsigned count=atomic_fetch_add(&managed,1)+1;
@@ -126,6 +162,7 @@ static NSString *layerState(CAMetalLayer *layer) {
 }
 static id<CAMetalDrawable> auditNextDrawable(id layer, SEL selector) {
     unsigned call=atomic_fetch_add(&drawableCalls,1)+1;
+    threadCensus(@"drawable");
     double start=CACurrentMediaTime();
     id<CAMetalDrawable> drawable=nextDrawable(layer,selector);
     double waited=(CACurrentMediaTime()-start)*1000;
@@ -171,6 +208,7 @@ static NSString *describe(id object) {
     return NSStringFromClass([object class]);
 }
 static void notePipeline(NSString *how, id request, id result, NSError *error, double start, unsigned long options) {
+    threadCensus(@"pipeline");
     double elapsed=CACurrentMediaTime()-start;
     unsigned count=atomic_fetch_add(&pipelines,1)+1;
     double previous=atomic_load(&slowest);
@@ -274,6 +312,7 @@ static id auditLibrary(id device, SEL selector, dispatch_data_t data, NSError *_
     NSError *local=nil;
     id library=libraryLoader(device,selector,data,&local);
     if (error) *error=local;
+    threadCensus(@"library");
     if (library) hookLibraryClass(object_getClass(library));
     else noteNil([NSString stringWithFormat:@"library from %zu bytes error=%@",dispatch_data_get_size(data),local]);
     return library;

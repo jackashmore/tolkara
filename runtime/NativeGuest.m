@@ -33,6 +33,8 @@ static NativeCodeMemory local_quarantine;
 #include <unistd.h>
 #include <mach/mach.h>
 #include <mach/arm/thread_status.h>
+#include <mach/mach_time.h>
+#include <mach/thread_policy.h>
 #include <pthread.h>
 #include <string.h>
 #include <signal.h>
@@ -327,6 +329,16 @@ static void sample_all_threads(unsigned number) {
         kern_return_t kr=thread_get_state(threads[i],ARM_THREAD_STATE64,(thread_state_t)&state,&stateCount);
         uintptr_t pc=kr==KERN_SUCCESS?arm_thread_state64_get_pc(state):0;
         char where[512]; describe_caller((void *)pc,where,sizeof where);
+        // How busy each thread is, and its scheduling: a spinning thread shows
+        // high CPU while running, a waiting one none while waiting.
+        thread_basic_info_data_t basic={0}; mach_msg_type_number_t basicCount=THREAD_BASIC_INFO_COUNT;
+        thread_extended_info_data_t extended={0}; mach_msg_type_number_t extendedCount=THREAD_EXTENDED_INFO_COUNT;
+        bool haveBasic=thread_info(threads[i],THREAD_BASIC_INFO,(thread_info_t)&basic,&basicCount)==KERN_SUCCESS;
+        bool haveExtended=thread_info(threads[i],THREAD_EXTENDED_INFO,(thread_info_t)&extended,&extendedCount)==KERN_SUCCESS;
+        LOG("[native] thread %u cpu=%d%% state=%d user=%d.%03ds policy=%d priority=%d name=%s\n",i,
+            haveBasic?basic.cpu_usage*100/TH_USAGE_SCALE:-1,haveBasic?basic.run_state:-1,
+            haveBasic?basic.user_time.seconds:0,haveBasic?basic.user_time.microseconds/1000:0,
+            haveBasic?basic.policy:-1,haveExtended?extended.pth_curpri:-1,haveExtended?extended.pth_name:"");
         LOG("[native] thread %u pc=%#lx %s\n",i,(unsigned long)pc,where);
         if(kr!=KERN_SUCCESS) { mach_port_deallocate(mach_task_self(),threads[i]); continue; }
         // Poor-man's stack: guest frames carry no frame pointers, so scan the
@@ -382,6 +394,14 @@ static void take_native_sample(thread_t thread, unsigned number) {
 static void *native_sampler(void *argument) {
     thread_t thread=(thread_t)(uintptr_t)argument;
     pthread_setname_np("Tolkara native sampler");
+    // Real-time band: at WoW Forever's crash this thread was still in its first
+    // 10-second sleep a minute later, every core busy with the guest's threads.
+    mach_timebase_info_data_t timebase={0}; mach_timebase_info(&timebase);
+    uint64_t millisecond=timebase.numer?1000000ULL*timebase.denom/timebase.numer:24000;
+    thread_time_constraint_policy_data_t policy={.period=0,.computation=(uint32_t)(2*millisecond),
+        .constraint=(uint32_t)(10*millisecond),.preemptible=TRUE};
+    kern_return_t kr=thread_policy_set(mach_thread_self(),THREAD_TIME_CONSTRAINT_POLICY,(thread_policy_t)&policy,THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+    LOG("[native] sampler thread running, real-time policy kr=%d\n",kr);
     for(unsigned number=1;number<=360;number++) { sleep(10); take_native_sample(thread,number); }
     mach_port_deallocate(mach_task_self(),thread);
     return NULL;

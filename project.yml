@@ -26,6 +26,14 @@ settings:
     GUEST_RUNTIME: emulated
     HEADER_SEARCH_PATHS: "$(SRCROOT)/runtime $(SRCROOT)/translation/Metal"
 schemes:
+  # tools/package_ipa.sh builds this scheme: a target-only build skips
+  # Swift package resource bundles (ZIPFoundation_ZIPFoundation.bundle).
+  TolkaraDiagnostics:
+    build:
+      targets:
+        TolkaraDiagnostics: all
+    management:
+      shared: true
   WolkaraExternalJIT:
     build:
       targets:

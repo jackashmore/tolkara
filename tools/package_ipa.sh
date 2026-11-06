@@ -23,7 +23,7 @@ tools/generate.sh
 # the ZIPFoundation package's resource bundle that the app copies.
 xcodebuild -project Tolkara.xcodeproj -scheme TolkaraDiagnostics -configuration Release \
     -destination 'generic/platform=iOS' -derivedDataPath build/unsigned-derived \
-    -arch arm64 SYMROOT=build/unsigned NATIVE_GUEST_SHIMS=GENERIC TOLKARA_MODE=external-jit \
+    ARCHS=arm64 SYMROOT=build/unsigned NATIVE_GUEST_SHIMS=GENERIC TOLKARA_MODE=external-jit \
     TOLKARA_SYSTEM_ROOTS="${TOLKARA_SYSTEM_ROOTS:-YES}" \
     INFOPLIST_KEY_CFBundleDisplayName=Wolkara \
     CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
